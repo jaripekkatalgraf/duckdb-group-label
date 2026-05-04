@@ -1,0 +1,297 @@
+-- test/sql/group_label.test
+-- DuckDB SQL Logic Tests for the group_label extension
+
+require group_label
+
+# ── connected_components ──────────────────────────────────────────────────────
+
+query III rowsort
+SELECT node_id, component_id, component_size
+FROM connected_components([1]::BIGINT[], []::BIGINT[], []::BIGINT[])
+----
+1	1	1
+
+query I
+SELECT count(DISTINCT component_id)
+FROM connected_components([1,2]::BIGINT[], []::BIGINT[], []::BIGINT[])
+----
+2
+
+query I
+SELECT count(DISTINCT component_id)
+FROM connected_components([1,2]::BIGINT[], [1]::BIGINT[], [2]::BIGINT[])
+----
+1
+
+query I
+SELECT component_size
+FROM connected_components([1,2]::BIGINT[], [1]::BIGINT[], [2]::BIGINT[])
+LIMIT 1
+----
+2
+
+query I
+SELECT count(DISTINCT component_id)
+FROM connected_components(
+    [1,2,3]::BIGINT[], [1,2]::BIGINT[], [2,3]::BIGINT[]
+)
+----
+1
+
+query I
+SELECT count(*) FROM connected_components([]::BIGINT[], []::BIGINT[], []::BIGINT[])
+----
+0
+
+# Star: all connected to node 1
+query I
+SELECT MAX(component_size)
+FROM connected_components(
+    [1,2,3,4,5]::BIGINT[],
+    [1,1,1,1]::BIGINT[],
+    [2,3,4,5]::BIGINT[]
+)
+----
+5
+
+
+# ── label_groups — basic spatial ─────────────────────────────────────────────
+# grid_w=4: pixel_id = y*4 + x
+# (x=0,y=0)=0  (x=1,y=0)=1  (x=2,y=0)=2  (x=3,y=0)=3
+# (x=0,y=1)=4  (x=1,y=1)=5  ...
+
+# Adjacent pixels (0,0) and (1,0), L1=1 → 1 component
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [1,2]::BIGINT[], [[0],[1]]::INTEGER[][], 4, 1.0, 'L1'
+)
+----
+1
+
+# Gap: (0,0) and (2,0), L1=2 > 1.0 → 2 components
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [1,2]::BIGINT[], [[0],[2]]::INTEGER[][], 4, 1.0, 'L1'
+)
+----
+2
+
+# Same gap, distance=2 → 1 component
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [1,2]::BIGINT[], [[0],[2]]::INTEGER[][], 4, 2.0, 'L1'
+)
+----
+1
+
+# Diagonal (0,0)=0 and (1,1)=5: L1=2 not connected, Linf=1 connected
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [1,2]::BIGINT[], [[0],[5]]::INTEGER[][], 4, 1.0, 'L1'
+)
+----
+2
+
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [1,2]::BIGINT[], [[0],[5]]::INTEGER[][], 4, 1.0, 'Linf'
+)
+----
+1
+
+# L2: sqrt(2)≈1.414 — boundary test
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [1,2]::BIGINT[], [[0],[5]]::INTEGER[][], 4, 1.41, 'L2'
+)
+----
+2
+
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [1,2]::BIGINT[], [[0],[5]]::INTEGER[][], 4, 1.42, 'L2'
+)
+----
+1
+
+# Chain A-B-C
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [1,2,3]::BIGINT[], [[0],[1],[2]]::INTEGER[][], 4, 1.0, 'L1'
+)
+----
+1
+
+# A-B connected, C isolated
+query II rowsort
+SELECT component_size, count(*) AS n FROM label_groups(
+    [1,2,3]::BIGINT[], [[0],[1],[15]]::INTEGER[][], 4, 1.0, 'L1'
+) GROUP BY component_size ORDER BY component_size
+----
+1	1
+2	2
+
+# Multi-pixel groups: Block A=[0,1], Block B=[3,7]
+# Closest pixels (1,0)↔(3,0): L1=2 > 1 → separate; L1≤2 → connected
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [1,2]::BIGINT[], [[0,1],[3,7]]::INTEGER[][], 4, 1.0, 'L1'
+)
+----
+2
+
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [1,2]::BIGINT[], [[0,1],[3,7]]::INTEGER[][], 4, 2.0, 'L1'
+)
+----
+1
+
+# Single group → its own component
+query III
+SELECT group_id, component_id, component_size FROM label_groups(
+    [42]::BIGINT[], [[0,1,2]]::INTEGER[][], 4, 1.0, 'L1'
+)
+----
+42	42	1
+
+# Empty → zero rows
+query I
+SELECT count(*) FROM label_groups([]::BIGINT[], []::INTEGER[][], 4, 1.0, 'L1')
+----
+0
+
+# component_id is always a valid group_id
+query I
+SELECT count(*) FROM (
+    SELECT group_id, component_id FROM label_groups(
+        [1,2,3,4]::BIGINT[], [[0],[1],[4],[5]]::INTEGER[][], 4, 1.0, 'L1'
+    ) WHERE component_id NOT IN (1,2,3,4)
+)
+----
+0
+
+
+# ── Standard pixel labeling ───────────────────────────────────────────────────
+# label_groups with single pixels = standard 4-connectivity
+# L-shape: (0,0)=0 (1,0)=1 (1,1)=9 (1,2)=17  in grid_w=8
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [10,11,12,13]::BIGINT[], [[0],[1],[9],[17]]::INTEGER[][], 8, 1.0, 'L1'
+)
+----
+1
+
+# (0,0) and (0,2) with gap at (0,1) → disconnected
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [10,11]::BIGINT[], [[0],[16]]::INTEGER[][], 8, 1.0, 'L1'
+)
+----
+2
+
+
+# ── Mass labeling with grid_id isolation ─────────────────────────────────────
+# grid_id prevents groups from different grids merging.
+# Encode: grid_id = puzzle_idx * 1000 + example_idx * 10 + is_input
+#
+# Two "puzzles" (grid 1 and grid 2), each with two adjacent groups at (0,0)(1,0).
+# Within each grid they should merge; across grids they should not.
+#
+# Group IDs: puzzle 1 → [10,11], puzzle 2 → [20,21]
+# Pixels:    all at local positions 0 and 1 (pixel_id = y*4+x)
+# grid_ids:  [1,1,2,2]
+
+query II rowsort
+SELECT component_id, component_size FROM label_groups(
+    [10,11,20,21]::BIGINT[],
+    [[0],[1],[0],[1]]::INTEGER[][],
+    4, 1.0, 'L1',
+    [1,1,2,2]::BIGINT[]     -- grid isolation
+) GROUP BY component_id, component_size ORDER BY component_id
+----
+10	2
+20	2
+
+# Without grid_ids: all four merge into one component
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [10,11,20,21]::BIGINT[],
+    [[0],[1],[0],[1]]::INTEGER[][],
+    4, 1.0, 'L1'
+)
+----
+1
+
+# With grid_ids: two separate components
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [10,11,20,21]::BIGINT[],
+    [[0],[1],[0],[1]]::INTEGER[][],
+    4, 1.0, 'L1',
+    [1,1,2,2]::BIGINT[]
+)
+----
+2
+
+# grid_id=0 means unconstrained: connects to any grid
+# Group 10 (grid=0) should connect to both grid 1 and grid 2 groups
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    [10,11,20]::BIGINT[],
+    [[0],[1],[0]]::INTEGER[][],
+    4, 1.0, 'L1',
+    [0,1,2]::BIGINT[]        -- 10=unconstrained, 11=grid1, 20=grid2
+)
+----
+1
+
+# ARC-style full mass label: 3 puzzles × 2 examples × both grids
+# All in one call with unique grid_ids. Spot check: each puzzle's groups
+# should be internally connected but cross-puzzle isolated.
+statement ok
+CREATE TEMP TABLE mass_test AS
+SELECT
+    (puzzle * 100 + ex * 10 + grp)::BIGINT AS gid,
+    [pos::INTEGER]::INTEGER[] AS px,
+    (puzzle * 1000 + ex)::BIGINT AS grid_id
+FROM (VALUES
+    -- puzzle 0, example 0: two adjacent objects at pos 0 and 1
+    (0, 0, 0, 0),
+    (0, 0, 1, 1),
+    -- puzzle 0, example 1: two adjacent objects at pos 0 and 1
+    (0, 1, 0, 0),
+    (0, 1, 1, 1),
+    -- puzzle 1, example 0: isolated object at pos 5 (far from others)
+    (1, 0, 0, 5)
+) t(puzzle, ex, grp, pos);
+
+query I
+SELECT count(DISTINCT component_id) FROM label_groups(
+    (SELECT list(gid ORDER BY gid) FROM mass_test),
+    (SELECT list(px  ORDER BY gid) FROM mass_test),
+    10, 1.0, 'L1',
+    (SELECT list(grid_id ORDER BY gid) FROM mass_test)
+)
+----
+3
+
+
+# ── SQL-predicate edges with connected_components ─────────────────────────────
+
+statement ok
+CREATE TEMP TABLE objects AS SELECT * FROM (VALUES
+    (1::BIGINT, 0), (2::BIGINT, 0), (3::BIGINT, 1), (4::BIGINT, 2)
+) t(obj_id, min_row);
+
+query II rowsort
+SELECT component_size, count(*) AS n FROM connected_components(
+    (SELECT list(obj_id ORDER BY obj_id) FROM objects),
+    (SELECT list(a.obj_id ORDER BY a.obj_id, b.obj_id)
+     FROM objects a JOIN objects b ON a.min_row=b.min_row AND a.obj_id < b.obj_id),
+    (SELECT list(b.obj_id ORDER BY a.obj_id, b.obj_id)
+     FROM objects a JOIN objects b ON a.min_row=b.min_row AND a.obj_id < b.obj_id)
+) GROUP BY component_size ORDER BY component_size
+----
+1	2
+2	2
